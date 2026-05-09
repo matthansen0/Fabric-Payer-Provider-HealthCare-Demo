@@ -149,7 +149,7 @@ Dual-path design: **Batch ETL** (authoritative, historical) + **Real-Time Intell
 
 ### Solution Architecture
 
-![Provider Healthcare Solution with Microsoft Fabric & AI](diagrams/healthcare-architecture.png)
+![Provider Healthcare Solution with Microsoft Fabric & AI](diagrams/healthcare-architecture.png?v=2)
 
 ### 🔬 Interactive 3D Ontology Knowledge Graph
 
