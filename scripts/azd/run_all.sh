@@ -278,21 +278,13 @@ run_postprovision | tee "$POSTPROVISION_LOG"
 POSTPROVISION_EXIT=${PIPESTATUS[0]}
 set -e
 
-NEEDS_NOTEBOOK_IMPORT=false
-if grep -q "One-time manual step" "$POSTPROVISION_LOG" || grep -q "not found in workspace" "$POSTPROVISION_LOG"; then
-  NEEDS_NOTEBOOK_IMPORT=true
-fi
-
-if [[ "$NEEDS_NOTEBOOK_IMPORT" == true ]]; then
-  if [[ "$ASSIST_MANUAL" == true ]]; then
-    show_manual_checkpoint_help
-    read -r
-    echo ""
-    echo "[run] Re-running post-provision bootstrap after manual import..."
-    echo ""
-    run_postprovision
-  else
-    echo "[warn] postprovision.py exited with code $POSTPROVISION_EXIT"
-    exit "$POSTPROVISION_EXIT"
-  fi
+# Always require manual notebook import for this tenant
+NOTEBOOK_MISSING_MSG="not found in workspace"
+if grep -q "$NOTEBOOK_MISSING_MSG" "$POSTPROVISION_LOG"; then
+  show_manual_checkpoint_help
+  read -r
+  echo ""
+  echo "[run] Re-running post-provision bootstrap after manual import..."
+  echo ""
+  run_postprovision
 fi

@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 import uuid
+import ast
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -43,6 +44,7 @@ class Cfg:
     fabric_capacity_id: str
     fabric_workspace_name: str
     notebook_name: str
+    run_launcher_on_nonempty_workspace: bool
     turbo_deploy: bool
     turbo_setup_sku: str
     turbo_scale_down_sku: str
@@ -93,7 +95,61 @@ def get_token(resource: str) -> str:
     )
 
 
+def _load_azd_env_values_into_process() -> int:
+    """Load values from `azd env get-values` into this process environment."""
+    try:
+        raw = run(["azd", "env", "get-values"], check=True)
+    except Exception as ex:
+        print("[WARN] Could not read azd environment values automatically.")
+        print(f"       {ex}")
+        return 0
+
+    loaded = 0
+    for line in raw.splitlines():
+        entry = line.strip()
+        if not entry or "=" not in entry:
+            continue
+
+        key, value = entry.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+
+        parsed_value = value
+        if value.startswith('"') and value.endswith('"'):
+            try:
+                parsed_value = ast.literal_eval(value)
+            except Exception:
+                parsed_value = value[1:-1]
+
+        current = os.getenv(key, "").strip()
+        if not current:
+            os.environ[key] = str(parsed_value)
+            loaded += 1
+
+    if loaded:
+        print(f"[INFO] Loaded {loaded} environment values from azd env.")
+    return loaded
+
+
+def _ensure_required_env_values(required_names: list[str]) -> None:
+    missing = [name for name in required_names if not os.getenv(name, "").strip()]
+    if not missing:
+        return
+    _load_azd_env_values_into_process()
+
+
 def load_cfg() -> Cfg:
+    _ensure_required_env_values(
+        [
+            "AZURE_SUBSCRIPTION_ID",
+            "AZURE_RESOURCE_GROUP",
+            "HUB_NAME",
+            "FABRIC_CAPACITY_ID",
+        ]
+    )
+
     # azd environment values are exported as env vars at hook runtime
     subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID", "").strip()
     resource_group = os.getenv("AZURE_RESOURCE_GROUP", "").strip()
@@ -105,6 +161,9 @@ def load_cfg() -> Cfg:
     # User-settable values (azd env set ...)
     fabric_workspace_name = os.getenv("FABRIC_WORKSPACE_NAME", "HealthcareDemo-WS").strip()
     notebook_name = os.getenv("FABRIC_LAUNCHER_NOTEBOOK_NAME", "Healthcare_Launcher").strip()
+    run_launcher_on_nonempty_workspace = (
+        os.getenv("RUN_LAUNCHER_ON_NONEMPTY_WORKSPACE", "false").strip().lower() == "true"
+    )
     turbo_deploy = os.getenv("TURBO_DEPLOY", "false").strip().lower() == "true"
     turbo_setup_sku = os.getenv("TURBO_SETUP_SKU", "F256").strip() or "F256"
     turbo_scale_down_sku = os.getenv("TURBO_SCALE_DOWN_SKU", "F64").strip() or "F64"
@@ -151,6 +210,7 @@ def load_cfg() -> Cfg:
         fabric_capacity_id=fabric_capacity_id,
         fabric_workspace_name=fabric_workspace_name,
         notebook_name=notebook_name,
+        run_launcher_on_nonempty_workspace=run_launcher_on_nonempty_workspace,
         turbo_deploy=turbo_deploy,
         turbo_setup_sku=turbo_setup_sku,
         turbo_scale_down_sku=turbo_scale_down_sku,
@@ -1060,9 +1120,12 @@ def run_launcher_notebook_if_present(cfg: Cfg, workspace_id: str) -> Tuple[Optio
 
     notebook_id = _find_notebook_id(token, workspace_id, cfg.notebook_name)
     if notebook_id and not _notebook_has_content(token, workspace_id, notebook_id):
-        print(f"[WARN] Notebook '{cfg.notebook_name}' exists but is empty. Re-importing...")
-        _delete_notebook_item(token, workspace_id, notebook_id)
-        notebook_id = None
+        print(
+            f"[WARN] Notebook '{cfg.notebook_name}' exists but definition appears empty via API."
+        )
+        print(
+            "       Preserving existing notebook (manual imports may not expose definition parts in this tenant)."
+        )
 
     items = fabric_api("GET", f"workspaces/{workspace_id}/items?type=Notebook", token)
     if items.status_code != 200:
@@ -1136,6 +1199,15 @@ def run_launcher_notebook_if_present(cfg: Cfg, workspace_id: str) -> Tuple[Optio
             print(f"[OK] Notebook run submitted: {cfg.notebook_name} (job id not returned by API)")
             print("[INFO] Skipping status wait because this tenant response omitted job id.")
             return notebook_id, None
+
+        if r.status_code == 409:
+            # If a run is already active, reuse its latest job ID and continue monitoring.
+            job_id = _find_latest_run_notebook_job_id(token, workspace_id, notebook_id)
+            if job_id:
+                print(
+                    f"[INFO] Notebook run already active; attaching to latest job: {job_id}"
+                )
+                return notebook_id, job_id
 
     print("[WARN] Could not start notebook run via API variants.")
     print("       Manual fallback: open workspace notebook and click Run All.")
@@ -1215,6 +1287,82 @@ def _find_latest_run_notebook_job_id(token: str, workspace_id: str, notebook_id:
     return None
 
 
+def _workspace_item_list(token: str, workspace_id: str) -> list[dict]:
+    r = fabric_api("GET", f"workspaces/{workspace_id}/items", token)
+    if r.status_code != 200:
+        return []
+    payload = r.json() if r.content else {}
+    values = payload.get("value") if isinstance(payload, dict) else None
+    if isinstance(values, list):
+        return [it for it in values if isinstance(it, dict)]
+    return []
+
+
+def _summarize_item_types(items: list[dict]) -> str:
+    counts: dict[str, int] = {}
+    for item in items:
+        item_type = str(item.get("type", "Unknown")).strip() or "Unknown"
+        counts[item_type] = counts.get(item_type, 0) + 1
+    parts = [f"{k}={counts[k]}" for k in sorted(counts.keys())]
+    return ", ".join(parts)
+
+
+def should_skip_launcher_run(cfg: Cfg, token: str, workspace_id: str) -> bool:
+    if cfg.run_launcher_on_nonempty_workspace:
+        return False
+
+    items = _workspace_item_list(token, workspace_id)
+    if not items:
+        return False
+
+    non_launcher_items = [
+        it
+        for it in items
+        if not (
+            str(it.get("type", "")).strip() == "Notebook"
+            and str(it.get("displayName", "")).strip() == cfg.notebook_name
+        )
+    ]
+    if not non_launcher_items:
+        return False
+
+    print(
+        "[INFO] Workspace already contains deployed artifacts; skipping launcher notebook run."
+    )
+    print(
+        "       Set RUN_LAUNCHER_ON_NONEMPTY_WORKSPACE=true to force a rerun."
+    )
+    print(
+        f"       Non-launcher item count: {len(non_launcher_items)}"
+    )
+    print(
+        f"       Item types: {_summarize_item_types(non_launcher_items)}"
+    )
+    return True
+
+
+def _print_notebook_failure_details(status_payload: dict) -> None:
+    if not isinstance(status_payload, dict):
+        return
+
+    failure = status_payload.get("failureReason")
+    if not isinstance(failure, dict):
+        failure = status_payload.get("error") if isinstance(status_payload.get("error"), dict) else {}
+
+    error_code = str(failure.get("errorCode", "")).strip() or "Unknown"
+    message = str(failure.get("message", "")).strip() or "No failure message returned by API."
+    request_id = str(failure.get("requestId", "")).strip()
+    root_activity_id = str(status_payload.get("rootActivityId", "")).strip()
+
+    print(f"[ERROR] Notebook run failed: {error_code}")
+    print(f"       {message}")
+    if request_id:
+        print(f"       requestId: {request_id}")
+    if root_activity_id:
+        print(f"       rootActivityId: {root_activity_id}")
+    print("       Open the notebook run details in Fabric Monitoring for statement-level errors.")
+
+
 def get_job_status(token: str, workspace_id: str, notebook_id: str, job_id: str) -> Optional[dict]:
     paths = [
         f"workspaces/{workspace_id}/items/{notebook_id}/jobs/instances/{job_id}",
@@ -1260,6 +1408,8 @@ def wait_for_notebook_completion(
                 f" | notebook job status: {status}"
             )
             if status in TERMINAL_STATES:
+                if status in {"failed", "error", "cancelled", "canceled", "timedout", "timeout"}:
+                    _print_notebook_failure_details(status_payload)
                 return status
 
         if elapsed >= max_seconds:
@@ -1336,25 +1486,33 @@ def main() -> int:
         print("[STEP] Ensuring Fabric workspace role assignments")
         ensure_fabric_workspace_role_assignments(ws_id)
         print(f"[STEP] Starting launcher notebook {cfg.notebook_name} if present")
-        notebook_id, job_id = run_launcher_notebook_if_present(cfg, ws_id)
-        if notebook_id and job_id:
-            final_status = wait_for_notebook_completion(cfg, ws_id, notebook_id, job_id)
-            if final_status:
-                print(f"[INFO] Notebook run finished with status: {final_status}")
+        fabric_token = get_token("https://api.fabric.microsoft.com")
+        skipped_launcher = should_skip_launcher_run(cfg, fabric_token, ws_id)
 
-            if cfg.turbo_deploy:
-                # Scale down after notebook reaches terminal state (success or failure).
-                if final_status is not None:
-                    scale_capacity_sku(cfg, cfg.turbo_scale_down_sku)
-                else:
-                    print("[WARN] Turbo mode enabled but notebook status timed out.")
-                    print("       Leaving capacity at turbo SKU to avoid premature scale-down.")
-                    print("       Re-run postprovision later or scale manually.")
+        if not skipped_launcher:
+            notebook_id, job_id = run_launcher_notebook_if_present(cfg, ws_id)
+            if notebook_id and job_id:
+                final_status = wait_for_notebook_completion(cfg, ws_id, notebook_id, job_id)
+                if final_status:
+                    print(f"[INFO] Notebook run finished with status: {final_status}")
+
+                if cfg.turbo_deploy:
+                    # Scale down after notebook reaches terminal state (success or failure).
+                    if final_status is not None:
+                        scale_capacity_sku(cfg, cfg.turbo_scale_down_sku)
+                    else:
+                        print("[WARN] Turbo mode enabled but notebook status timed out.")
+                        print("       Leaving capacity at turbo SKU to avoid premature scale-down.")
+                        print("       Re-run postprovision later or scale manually.")
+            elif cfg.turbo_deploy:
+                print("[WARN] Turbo mode enabled but notebook did not start.")
+                print("       Capacity remains at turbo SKU until notebook run completes.")
+                print("       After manual run, execute:")
+                print("       python3 scripts/azd/postprovision.py")
         elif cfg.turbo_deploy:
             print("[WARN] Turbo mode enabled but notebook did not start.")
-            print("       Capacity remains at turbo SKU until notebook run completes.")
-            print("       After manual run, execute:")
-            print("       python3 scripts/azd/postprovision.py")
+            print("       Launcher execution was skipped because workspace is non-empty.")
+            print("       Capacity remains unchanged.")
 
     print("=== Done ===")
     return 0
