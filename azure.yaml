@@ -1,0 +1,20 @@
+name: fabric-healthcare-demo
+metadata:
+  template: fabric-healthcare-demo@0.1.0
+infra:
+  provider: bicep
+  path: infra
+  parameters:
+    location: ${LOCATION}
+    hubName: ${HUB_NAME}
+    projectName: ${PROJECT_NAME}
+    searchServiceName: ${SEARCH_SERVICE_NAME}
+    fabricCapacityName: ${FABRIC_CAPACITY_NAME}
+    fabricCapacitySku: ${FABRIC_CAPACITY_SKU}
+    fabricCapacityAdmins: ${FABRIC_CAPACITY_ADMINS}
+hooks:
+  postprovision:
+    posix:
+      run: python3 scripts/azd/postprovision.py
+      shell: sh
+      continueOnError: true

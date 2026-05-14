@@ -1,0 +1,192 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.43.8.12551",
+      "templateHash": "7014521160742851796"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "swedencentral",
+      "metadata": {
+        "description": "Azure region for all Azure resources. Keep aligned with Fabric workspace region."
+      }
+    },
+    "resourceTags": {
+      "type": "object",
+      "defaultValue": {
+        "project": "fabric-healthcare-demo",
+        "managedBy": "azd"
+      },
+      "metadata": {
+        "description": "Resource group location tag for generated resources"
+      }
+    },
+    "hubName": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure AI Foundry hub/account name (must be globally unique)"
+      }
+    },
+    "projectName": {
+      "type": "string",
+      "defaultValue": "HealthcareDemo-HLS",
+      "metadata": {
+        "description": "Foundry project name"
+      }
+    },
+    "searchServiceName": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure AI Search service name (must be globally unique)"
+      }
+    },
+    "fabricCapacityName": {
+      "type": "string",
+      "metadata": {
+        "description": "Fabric capacity resource name (must be globally unique in tenant context)"
+      }
+    },
+    "fabricCapacitySku": {
+      "type": "string",
+      "defaultValue": "F64",
+      "allowedValues": [
+        "F2",
+        "F4",
+        "F8",
+        "F16",
+        "F32",
+        "F64",
+        "F128",
+        "F256",
+        "F512",
+        "F1024",
+        "F2048"
+      ],
+      "metadata": {
+        "description": "Fabric capacity SKU"
+      }
+    },
+    "fabricCapacityAdmins": {
+      "type": "string",
+      "metadata": {
+        "description": "Fabric capacity admins as JSON array string (for example: [\"admin@contoso.com\"]). At least one value is required by Microsoft.Fabric/capacities."
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.CognitiveServices/accounts",
+      "apiVersion": "2025-06-01",
+      "name": "[parameters('hubName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "sku": {
+        "name": "S0"
+      },
+      "kind": "AIServices",
+      "tags": "[parameters('resourceTags')]",
+      "properties": {
+        "allowProjectManagement": true,
+        "customSubDomainName": "[toLower(parameters('hubName'))]",
+        "publicNetworkAccess": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.Search/searchServices",
+      "apiVersion": "2023-11-01",
+      "name": "[parameters('searchServiceName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "basic"
+      },
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "tags": "[parameters('resourceTags')]",
+      "properties": {
+        "disableLocalAuth": false,
+        "publicNetworkAccess": "enabled",
+        "authOptions": {
+          "aadOrApiKey": {
+            "aadAuthFailureMode": "http401WithBearerChallenge"
+          }
+        },
+        "networkRuleSet": {
+          "ipRules": []
+        },
+        "replicaCount": 1,
+        "partitionCount": 1,
+        "semanticSearch": "free"
+      }
+    },
+    {
+      "type": "Microsoft.Fabric/capacities",
+      "apiVersion": "2023-11-01",
+      "name": "[parameters('fabricCapacityName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "[parameters('fabricCapacitySku')]",
+        "tier": "Fabric"
+      },
+      "tags": "[parameters('resourceTags')]",
+      "properties": {
+        "administration": {
+          "members": "[json(parameters('fabricCapacityAdmins'))]"
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "LOCATION": {
+      "type": "string",
+      "value": "[parameters('location')]"
+    },
+    "HUB_NAME": {
+      "type": "string",
+      "value": "[parameters('hubName')]"
+    },
+    "PROJECT_NAME": {
+      "type": "string",
+      "value": "[parameters('projectName')]"
+    },
+    "AI_SERVICES_ID": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.CognitiveServices/accounts', parameters('hubName'))]"
+    },
+    "AI_SERVICES_NAME": {
+      "type": "string",
+      "value": "[parameters('hubName')]"
+    },
+    "AI_SERVICES_PRINCIPAL_ID": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.CognitiveServices/accounts', parameters('hubName')), '2025-06-01', 'full').identity.principalId]"
+    },
+    "SEARCH_SERVICE_NAME": {
+      "type": "string",
+      "value": "[parameters('searchServiceName')]"
+    },
+    "SEARCH_SERVICE_ID": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Search/searchServices', parameters('searchServiceName'))]"
+    },
+    "SEARCH_SERVICE_PRINCIPAL_ID": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Search/searchServices', parameters('searchServiceName')), '2023-11-01', 'full').identity.principalId]"
+    },
+    "FABRIC_CAPACITY_NAME": {
+      "type": "string",
+      "value": "[parameters('fabricCapacityName')]"
+    },
+    "FABRIC_CAPACITY_ID": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Fabric/capacities', parameters('fabricCapacityName'))]"
+    }
+  }
+}

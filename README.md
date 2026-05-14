@@ -104,6 +104,18 @@ All from a single workspace deployed in minutes.
    *(Workspace → Import → Notebook → upload the .ipynb file)*
 3. **Run All** — wait ~15-20 minutes
 
+### Want Full Automation With `azd`?
+
+Use the `azd` scaffold to provision Azure resources + Fabric capacity/workspace and run post-provision bootstrap:
+
+- See [AZD_AUTOMATION_GUIDE.md](AZD_AUTOMATION_GUIDE.md)
+- Default region is `swedencentral`
+- One-command turbo mode (F256 setup -> F64 auto-scale):
+
+```bash
+bash scripts/azd/run_all.sh --turbodeploy
+```
+
 > **That's it — no configuration needed.** The notebook pulls from the public repo `rasgiza/Fabric-Payer-Provider-HealthCare-Demo` by default. If you want to change settings, edit the CONFIG cell before running — for example, set `DEPLOY_STREAMING = True` to enable Real-Time Intelligence (Eventhouse + KQL + scoring), or point `GITHUB_OWNER` to your own fork.
 >
 > **First deployment** deploys ETL + Agents (Cells 1-11). Set `DEPLOY_STREAMING = True` for the full RTI stack (Cells 12-13).
