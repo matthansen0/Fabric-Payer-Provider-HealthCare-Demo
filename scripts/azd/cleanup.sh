@@ -54,24 +54,33 @@ if [[ -z "$SUBSCRIPTION_ID" ]]; then
   exit 1
 fi
 
+FABRIC_WORKSPACE_NAME="$(azd env get-value FABRIC_WORKSPACE_NAME 2>/dev/null || true)"
+if [[ -z "$FABRIC_WORKSPACE_NAME" ]]; then
+  FABRIC_WORKSPACE_NAME="HealthcareDemo-WS"
+fi
+
 # Run azd down (will delete resources defined in infra)
 echo "[info] Running azd down for environment: $ENV_NAME"
 azd down --purge || true
 
 
 # Explicitly delete the resource group to ensure all resources are purged
-if az group exists --name "$RESOURCE_GROUP" --subscription "$SUBSCRIPTION_ID" >/dev/null; then
+RG_EXISTS="$(az group exists --name "$RESOURCE_GROUP" --subscription "$SUBSCRIPTION_ID" 2>/dev/null || echo false)"
+if [[ "$RG_EXISTS" == "true" ]]; then
   echo "[info] Deleting resource group: $RESOURCE_GROUP"
-  az group delete --name "$RESOURCE_GROUP" --subscription "$SUBSCRIPTION_ID" --yes --no-wait
-  echo "[done] Cleanup initiated. Resource group deletion may take several minutes."
-  echo "[info] You can check status with: az group show --name $RESOURCE_GROUP --subscription $SUBSCRIPTION_ID"
+  if az group delete --name "$RESOURCE_GROUP" --subscription "$SUBSCRIPTION_ID" --yes --no-wait; then
+    echo "[done] Cleanup initiated. Resource group deletion may take several minutes."
+    echo "[info] You can check status with: az group show --name $RESOURCE_GROUP --subscription $SUBSCRIPTION_ID"
+  else
+    echo "[warn] Could not delete resource group '$RESOURCE_GROUP'. Continuing with Fabric workspace cleanup."
+  fi
 else
   echo "[info] Resource group '$RESOURCE_GROUP' was already removed."
 fi
 
 # Attempt to delete Fabric workspace via API
 echo "[info] Attempting to delete Fabric workspace via API (if present)"
-python3 "$(dirname "$0")/delete_fabric_workspace.py"
+python3 "$(dirname "$0")/delete_fabric_workspace.py" --workspace-name "$FABRIC_WORKSPACE_NAME"
 
 if [[ "$REMOVE_ENV" == true ]]; then
   echo "[info] Removing local azd environment: $ENV_NAME"
