@@ -138,6 +138,8 @@ Polling interval and timeout are configurable via azd env vars:
 
 - `NOTEBOOK_RUN_POLL_SECONDS` (default `30`)
 - `NOTEBOOK_RUN_MAX_MINUTES` (default `240`)
+- `NOTEBOOK_RUN_MAX_ATTEMPTS` (default `2`)
+- `NOTEBOOK_RETRY_DELAY_SECONDS` (default `20`)
 
 Notebook job tracking is resilient to tenant differences:
 
@@ -188,3 +190,35 @@ These tenant-level settings must be enabled by a Fabric admin for the full demo:
 4. Enable Operations Agent
 
 Also ensure Fabric admin/capacity permissions are active for the deployment identity before running automation.
+
+---
+
+## Automated Steps
+The following steps are now fully automated by the deployment scripts:
+
+- Azure resource deployment (workspaces, capacity, AI Search, etc.)
+- Foundry project creation
+- Model deployments
+- RBAC assignments
+- Fabric workspace creation and assignment
+- Notebook import and execution
+- Indexer verification and reset (see scripts/automation/verify_and_reset_indexer.sh)
+
+## Manual Steps Remaining
+After automation completes, perform these steps in the Foundry portal:
+
+1. **Create and publish the Fabric Data Agent**
+   - Publish the Data Agent in Fabric and note the connection ID.
+2. **Create a Knowledge Source (OneLake)**
+   - Add a knowledge source pointing to your Lakehouse folder.
+3. **Create a Knowledge Base**
+   - Link it to the Knowledge Source and add retrieval instructions.
+4. **Connect the Fabric Data Agent to Foundry**
+   - Register the connection in the Foundry portal.
+5. **Create the Orchestrator Agent**
+   - Add the Fabric Data Agent as a tool/knowledge source.
+6. **Test the agent with sample queries**
+
+See the detailed instructions and screenshots below for each manual step.
+
+---

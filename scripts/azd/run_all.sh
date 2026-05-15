@@ -130,7 +130,33 @@ run_postprovision() {
   set -a
   eval "$(azd env get-values)"
   set +a
-  python3 scripts/azd/postprovision.py
+  python3 -u scripts/azd/postprovision.py
+}
+
+run_with_heartbeat() {
+  local label="$1"
+  shift
+
+  local heartbeat_seconds=30
+  local start_ts
+  start_ts="$(date +%s)"
+
+  "$@" &
+  local cmd_pid=$!
+
+  while kill -0 "$cmd_pid" >/dev/null 2>&1; do
+    sleep "$heartbeat_seconds"
+    if kill -0 "$cmd_pid" >/dev/null 2>&1; then
+      local now elapsed mins secs
+      now="$(date +%s)"
+      elapsed=$((now - start_ts))
+      mins=$((elapsed / 60))
+      secs=$((elapsed % 60))
+      printf '[wait] %s still running (%dm %02ds elapsed)\n' "$label" "$mins" "$secs"
+    fi
+  done
+
+  wait "$cmd_pid"
 }
 
 show_manual_checkpoint_help() {
@@ -257,14 +283,13 @@ else
 fi
 
 echo "[run] Starting azd up (this may take a long time)..."
-azd up
-
-# Clean up any stale Fabric workspace from previous runs
 FABRIC_WS_NAME="$(get_env_value_safe FABRIC_WORKSPACE_NAME)"
 if [[ -n "$FABRIC_WS_NAME" ]]; then
-  echo "[cleanup] Removing stale Fabric workspace if it exists..."
+  echo "[cleanup] Removing stale Fabric workspace before azd up (if it exists)..."
   cleanup_stale_fabric_workspace "$FABRIC_WS_NAME"
 fi
+
+run_with_heartbeat "azd up" env SKIP_AZD_POSTPROVISION=true azd up
 
 echo "[done] azd up complete"
 if [[ "$TURBO" == true ]]; then
@@ -278,11 +303,20 @@ run_postprovision | tee "$POSTPROVISION_LOG"
 POSTPROVISION_EXIT=${PIPESTATUS[0]}
 set -e
 
-# Always require manual notebook import for this tenant
-NOTEBOOK_MISSING_MSG="not found in workspace"
-if grep -q "$NOTEBOOK_MISSING_MSG" "$POSTPROVISION_LOG"; then
+# Trigger manual import only when postprovision definitively reports notebook-missing failure.
+NOTEBOOK_MISSING_MSG_PRIMARY="is still missing in workspace."
+NOTEBOOK_MISSING_MSG_FALLBACK="Manual fallback: Fabric workspace -> Import -> Notebook -> Healthcare_Launcher.ipynb"
+if grep -q "$NOTEBOOK_MISSING_MSG_PRIMARY" "$POSTPROVISION_LOG" || \
+   grep -q "$NOTEBOOK_MISSING_MSG_FALLBACK" "$POSTPROVISION_LOG"; then
   show_manual_checkpoint_help
-  read -r
+  if [[ -r /dev/tty ]]; then
+    read -r < /dev/tty
+  else
+    echo "[warn] Non-interactive shell detected; cannot wait for Enter."
+    echo "[next] Import notebook manually, then run:"
+    echo "       set -a && eval \"\$(azd env get-values)\" && set +a && python3 -u scripts/azd/postprovision.py"
+    exit 0
+  fi
   echo ""
   echo "[run] Re-running post-provision bootstrap after manual import..."
   echo ""

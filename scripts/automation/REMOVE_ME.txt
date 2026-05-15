@@ -1,0 +1,1 @@
+The orchestrator agent automation scripts have been removed. Only indexer automation remains in this folder.

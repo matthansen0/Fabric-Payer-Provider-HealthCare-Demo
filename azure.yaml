@@ -15,6 +15,6 @@ infra:
 hooks:
   postprovision:
     posix:
-      run: python3 scripts/azd/postprovision.py
+      run: if [ "${SKIP_AZD_POSTPROVISION:-false}" = "true" ]; then echo "[info] Skipping azd hook postprovision (run_all will execute it)"; else python3 -u scripts/azd/postprovision.py; fi
       shell: sh
       continueOnError: true

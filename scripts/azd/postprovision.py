@@ -50,6 +50,8 @@ class Cfg:
     turbo_scale_down_sku: str
     notebook_poll_seconds: int
     notebook_max_minutes: int
+    notebook_run_max_attempts: int
+    notebook_retry_delay_seconds: int
     deploy_foundry_models: bool
     foundry_chat_deployment_name: str
     foundry_chat_model_name: str
@@ -77,6 +79,33 @@ def run(cmd: list[str], check: bool = True) -> str:
     if check and p.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{p.stderr.strip()}")
     return p.stdout.strip()
+
+
+def run_with_wait_output(
+    cmd: list[str],
+    label: str,
+    heartbeat_seconds: int = 20,
+    check: bool = True,
+) -> None:
+    print(f"[RUN] {label}")
+    proc = subprocess.Popen(cmd)
+    start = time.time()
+
+    while proc.poll() is None:
+        time.sleep(max(heartbeat_seconds, 5))
+        if proc.poll() is None:
+            elapsed = int(time.time() - start)
+            mins = elapsed // 60
+            secs = elapsed % 60
+            print(f"[WAIT] {label} still running ({mins}m {secs:02d}s elapsed)")
+
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
+
+    elapsed = int(time.time() - start)
+    mins = elapsed // 60
+    secs = elapsed % 60
+    print(f"[OK] {label} completed ({mins}m {secs:02d}s)")
 
 
 def get_token(resource: str) -> str:
@@ -169,6 +198,8 @@ def load_cfg() -> Cfg:
     turbo_scale_down_sku = os.getenv("TURBO_SCALE_DOWN_SKU", "F64").strip() or "F64"
     notebook_poll_seconds = int(os.getenv("NOTEBOOK_RUN_POLL_SECONDS", "30"))
     notebook_max_minutes = int(os.getenv("NOTEBOOK_RUN_MAX_MINUTES", "240"))
+    notebook_run_max_attempts = max(1, int(os.getenv("NOTEBOOK_RUN_MAX_ATTEMPTS", "2")))
+    notebook_retry_delay_seconds = max(5, int(os.getenv("NOTEBOOK_RETRY_DELAY_SECONDS", "20")))
     deploy_foundry_models = os.getenv("DEPLOY_FOUNDRY_MODELS", "true").strip().lower() == "true"
     foundry_chat_deployment_name = os.getenv("FOUNDRY_CHAT_DEPLOYMENT_NAME", "gpt-4o").strip()
     foundry_chat_model_name = os.getenv("FOUNDRY_CHAT_MODEL_NAME", "gpt-4o").strip()
@@ -216,6 +247,8 @@ def load_cfg() -> Cfg:
         turbo_scale_down_sku=turbo_scale_down_sku,
         notebook_poll_seconds=notebook_poll_seconds,
         notebook_max_minutes=notebook_max_minutes,
+        notebook_run_max_attempts=notebook_run_max_attempts,
+        notebook_retry_delay_seconds=notebook_retry_delay_seconds,
         deploy_foundry_models=deploy_foundry_models,
         foundry_chat_deployment_name=foundry_chat_deployment_name,
         foundry_chat_model_name=foundry_chat_model_name,
@@ -398,7 +431,7 @@ def ensure_foundry_model_deployments(cfg: Cfg) -> None:
             continue
 
         try:
-            run(
+            run_with_wait_output(
                 [
                     "az",
                     "cognitiveservices",
@@ -424,6 +457,7 @@ def ensure_foundry_model_deployments(cfg: Cfg) -> None:
                     "-o",
                     "json",
                 ],
+                label=f"Deploying Foundry model '{deployment_name}'",
                 check=True,
             )
             print(f"[OK] Foundry model deployed: {deployment_name}")
@@ -656,13 +690,45 @@ def _convert_ipynb_to_fabric_py(ipynb_path: Path) -> str:
 
 
 def _find_notebook_id(token: str, workspace_id: str, notebook_name: str) -> Optional[str]:
+    def normalize(name: str) -> str:
+        n = (name or "").strip().lower()
+        if n.endswith(".ipynb"):
+            n = n[:-6]
+        return n
+
+    target = normalize(notebook_name)
+    paths = [
+        f"workspaces/{workspace_id}/items?type=Notebook",
+        f"workspaces/{workspace_id}/items",
+    ]
+
+    for path in paths:
+        r = fabric_api("GET", path, token)
+        if r.status_code != 200:
+            continue
+
+        for it in r.json().get("value", []):
+            item_type = str(it.get("type", "")).strip().lower()
+            display_name = str(it.get("displayName", "")).strip()
+            if item_type and item_type != "notebook":
+                continue
+            if normalize(display_name) == target:
+                return it.get("id")
+
+    return None
+
+
+def _list_notebook_display_names(token: str, workspace_id: str) -> list[str]:
     r = fabric_api("GET", f"workspaces/{workspace_id}/items?type=Notebook", token)
     if r.status_code != 200:
-        return None
+        return []
+
+    names = []
     for it in r.json().get("value", []):
-        if it.get("displayName") == notebook_name:
-            return it.get("id")
-    return None
+        name = str(it.get("displayName", "")).strip()
+        if name:
+            names.append(name)
+    return names
 
 
 def _get_item_definition_parts(token: str, workspace_id: str, item_id: str) -> list:
@@ -717,11 +783,13 @@ def _wait_for_notebook_with_content(
     workspace_id: str,
     notebook_name: str,
     attempt_label: str,
-    poll_count: int = 6,
-    poll_interval: float = 3.0,
+    poll_count: int = 24,
+    poll_interval: float = 5.0,
 ) -> Optional[str]:
     """
-    Poll until a notebook with the given name appears in the workspace AND has content.
+    Poll until a notebook with the given name appears in the workspace.
+    Prefer content verification when available, but do not delete notebooks when
+    this tenant does not expose definition parts reliably.
     Returns the notebook ID on success, or None if it never materialises.
     """
     for _ in range(poll_count):
@@ -730,14 +798,19 @@ def _wait_for_notebook_with_content(
             if _notebook_has_content(token, workspace_id, notebook_id):
                 print(f"[OK] Imported notebook '{notebook_name}' ({attempt_label}).")
                 return notebook_id
-            # Exists but empty — delete and stop polling; caller will decide next step.
+            # Some tenants do not expose definition content via getDefinition.
             print(
-                f"[INFO] {attempt_label}: notebook appeared but definition is empty; "
-                "deleting and retrying next attempt..."
+                f"[INFO] {attempt_label}: notebook appeared, but definition content is not visible via API."
             )
-            _delete_notebook_item(token, workspace_id, notebook_id)
-            return None
+            print("       Treating import as successful to avoid deleting a valid notebook.")
+            return notebook_id
         time.sleep(poll_interval)
+
+    visible = _list_notebook_display_names(token, workspace_id)
+    if visible:
+        print("[INFO] Notebook listing seen by API: " + ", ".join(sorted(set(visible))))
+    else:
+        print("[INFO] Notebook listing seen by API: <none>")
     return None
 
 
@@ -812,7 +885,11 @@ def _try_update_definition(token: str, workspace_id: str, notebook_id: str, note
     return _notebook_has_content(token, workspace_id, notebook_id)
 
 
-def try_import_launcher_notebook(cfg: Cfg, token: str, workspace_id: str) -> Tuple[bool, bool]:
+def try_import_launcher_notebook(
+    cfg: Cfg,
+    token: str,
+    workspace_id: str,
+) -> Tuple[bool, bool, Optional[str]]:
     """
     Try to import Healthcare_Launcher notebook automatically.
 
@@ -823,14 +900,14 @@ def try_import_launcher_notebook(cfg: Cfg, token: str, workspace_id: str) -> Tup
          (recommended by Microsoft as most reliable for CI/CD).
       3. Legacy .platform + notebook-content.py parts format (fallback).
 
-    Returns:
-      (imported, feature_unavailable)
+        Returns:
+            (imported, feature_unavailable, notebook_id)
     """
     repo_root = Path(__file__).resolve().parents[2]
     launcher_path = repo_root / "Healthcare_Launcher.ipynb"
     if not launcher_path.exists():
         print(f"[WARN] Launcher notebook file not found on disk: {launcher_path}")
-        return False, False
+        return False, False, None
 
     notebook_b64 = base64.b64encode(launcher_path.read_bytes()).decode("utf-8")
     print(f"[INFO] Encoded notebook (ipynb format): {len(notebook_b64)} bytes of Base64")
@@ -855,9 +932,9 @@ def try_import_launcher_notebook(cfg: Cfg, token: str, workspace_id: str) -> Tup
     # be "artifact.content.ipynb".
     attempt1_label = "attempt 1 (ipynb import)"
     stale_id = _find_notebook_id(token, workspace_id, cfg.notebook_name)
-    if stale_id and not _notebook_has_content(token, workspace_id, stale_id):
-        print(f"[INFO] Existing empty notebook found. Replacing for {attempt1_label}...")
-        _delete_notebook_item(token, workspace_id, stale_id)
+    if stale_id:
+        print(f"[INFO] Existing notebook found before {attempt1_label}; reusing it.")
+        return True, False, stale_id
 
     print(f"[INFO] Import {attempt1_label}: POST workspaces/{workspace_id}/items")
     print(f"       Definition parts: artifact.content.ipynb  (format=ipynb)")
@@ -884,7 +961,16 @@ def try_import_launcher_notebook(cfg: Cfg, token: str, workspace_id: str) -> Tup
         print(f"[INFO] HTTP {r1.status_code} — waiting for notebook to materialise...")
         nb_id = _wait_for_notebook_with_content(token, workspace_id, cfg.notebook_name, attempt1_label)
         if nb_id:
-            return True, False
+            return True, False, nb_id
+
+        optimistic_id = _extract_item_id_from_create_response(r1)
+        if optimistic_id:
+            print(
+                f"[INFO] {attempt1_label}: assuming import success from HTTP {r1.status_code}; "
+                f"using returned notebook id {optimistic_id}."
+            )
+            return True, False, optimistic_id
+
         print(f"[INFO] {attempt1_label} accepted but notebook did not materialise with content.")
     elif r1 is not None:
         err_code = _response_error_code(r1)
@@ -897,10 +983,8 @@ def try_import_launcher_notebook(cfg: Cfg, token: str, workspace_id: str) -> Tup
     attempt2_label = "attempt 2 (create + updateDefinition)"
     stale_id = _find_notebook_id(token, workspace_id, cfg.notebook_name)
     if stale_id:
-        if _notebook_has_content(token, workspace_id, stale_id):
-            print(f"[OK] Notebook already has content after attempt 1 cleanup; done.")
-            return True, False
-        _delete_notebook_item(token, workspace_id, stale_id)
+        print(f"[INFO] Existing notebook found before {attempt2_label}; reusing it.")
+        return True, False, stale_id
 
     print(f"[INFO] Import {attempt2_label}: creating empty notebook shell...")
     r2 = _post_with_name_retry(
@@ -922,10 +1006,21 @@ def try_import_launcher_notebook(cfg: Cfg, token: str, workspace_id: str) -> Tup
             print(f"[INFO] {attempt2_label}: shell created ({nb_id}). Pushing definition...")
             if _try_update_definition(token, workspace_id, nb_id, notebook_b64):
                 print(f"[OK] Imported notebook '{cfg.notebook_name}' ({attempt2_label}).")
-                return True, False
+                return True, False, nb_id
             print(f"[INFO] {attempt2_label}: updateDefinition did not produce content.")
-            _delete_notebook_item(token, workspace_id, nb_id)
+            print(
+                f"[INFO] {attempt2_label}: proceeding with existing notebook shell id {nb_id} "
+                "despite missing definition visibility."
+            )
+            return True, False, nb_id
         else:
+            optimistic_id = _extract_item_id_from_create_response(r2)
+            if optimistic_id:
+                print(
+                    f"[INFO] {attempt2_label}: assuming shell create success from HTTP {r2.status_code}; "
+                    f"using returned notebook id {optimistic_id}."
+                )
+                return True, False, optimistic_id
             print(f"[INFO] {attempt2_label}: empty shell never appeared in workspace.")
     elif r2 is not None:
         err_code = _response_error_code(r2)
@@ -937,8 +1032,9 @@ def try_import_launcher_notebook(cfg: Cfg, token: str, workspace_id: str) -> Tup
     # ── Attempt 3: legacy .platform + notebook-content.py format ──
     attempt3_label = "attempt 3 (.platform + notebook-content.py)"
     stale_id = _find_notebook_id(token, workspace_id, cfg.notebook_name)
-    if stale_id and not _notebook_has_content(token, workspace_id, stale_id):
-        _delete_notebook_item(token, workspace_id, stale_id)
+    if stale_id:
+        print(f"[INFO] Existing notebook found before {attempt3_label}; reusing it.")
+        return True, False, stale_id
 
     print(f"[INFO] Import {attempt3_label}: POST workspaces/{workspace_id}/items")
     print(f"       Definition parts: .platform, notebook-content.py")
@@ -961,7 +1057,16 @@ def try_import_launcher_notebook(cfg: Cfg, token: str, workspace_id: str) -> Tup
         print(f"[INFO] HTTP {r3.status_code} — waiting for notebook to materialise...")
         nb_id = _wait_for_notebook_with_content(token, workspace_id, cfg.notebook_name, attempt3_label)
         if nb_id:
-            return True, False
+            return True, False, nb_id
+
+        optimistic_id = _extract_item_id_from_create_response(r3)
+        if optimistic_id:
+            print(
+                f"[INFO] {attempt3_label}: assuming import success from HTTP {r3.status_code}; "
+                f"using returned notebook id {optimistic_id}."
+            )
+            return True, False, optimistic_id
+
         print(f"[INFO] {attempt3_label} accepted but notebook did not materialise with content.")
     elif r3 is not None:
         err_code = _response_error_code(r3)
@@ -970,7 +1075,7 @@ def try_import_launcher_notebook(cfg: Cfg, token: str, workspace_id: str) -> Tup
         else:
             print(f"[INFO] {attempt3_label} failed: HTTP {r3.status_code} {err_code or ''}".rstrip())
 
-    return False, saw_feature_unavailable
+    return False, saw_feature_unavailable, None
 
 
 def fabric_workspace_ensure(cfg: Cfg) -> Optional[str]:
@@ -1139,10 +1244,25 @@ def run_launcher_notebook_if_present(cfg: Cfg, workspace_id: str) -> Tuple[Optio
                 break
 
     if not notebook_id:
-        print(f"[INFO] Notebook '{cfg.notebook_name}' not found in workspace. Trying auto-import...")
-        imported, feature_unavailable = try_import_launcher_notebook(cfg, token, workspace_id)
+        print("[INFO] Waiting briefly for notebook visibility before auto-import...")
+        for _ in range(12):
+            notebook_id = _find_notebook_id(token, workspace_id, cfg.notebook_name)
+            if notebook_id:
+                break
+            time.sleep(5)
 
-        if imported:
+    if not notebook_id:
+        print(f"[INFO] Notebook '{cfg.notebook_name}' not found in workspace. Trying auto-import...")
+        imported, feature_unavailable, imported_notebook_id = try_import_launcher_notebook(
+            cfg,
+            token,
+            workspace_id,
+        )
+
+        if imported_notebook_id:
+            notebook_id = imported_notebook_id
+
+        if imported and not notebook_id:
             items = fabric_api("GET", f"workspaces/{workspace_id}/items?type=Notebook", token)
             if items.status_code == 200:
                 for it in items.json().get("value", []):
@@ -1236,6 +1356,27 @@ def _extract_job_id_from_location_header(resp: requests.Response) -> Optional[st
     m = re.search(r"/jobs/instances/([0-9a-fA-F-]{36})", location)
     if m:
         return m.group(1)
+    return None
+
+
+def _extract_item_id_from_create_response(resp: requests.Response) -> Optional[str]:
+    try:
+        payload = resp.json() if resp.content else {}
+    except Exception:
+        payload = {}
+
+    if isinstance(payload, dict):
+        for key in ("id", "itemId"):
+            val = str(payload.get(key, "")).strip()
+            if re.fullmatch(r"[0-9a-fA-F-]{36}", val):
+                return val
+
+    location = resp.headers.get("Location") or resp.headers.get("location")
+    if location:
+        m = re.search(r"/items/([0-9a-fA-F-]{36})", location)
+        if m:
+            return m.group(1)
+
     return None
 
 
@@ -1423,7 +1564,7 @@ def scale_capacity_sku(cfg: Cfg, sku_name: str) -> bool:
     print(f"[INFO] Scaling Fabric capacity to {sku_name}...")
     try:
         # Use ARM resource update to avoid endpoint variations in az rest body contracts.
-        run(
+        run_with_wait_output(
             [
                 "az",
                 "resource",
@@ -1435,7 +1576,8 @@ def scale_capacity_sku(cfg: Cfg, sku_name: str) -> bool:
                 "--set",
                 f"sku.name={sku_name}",
                 "sku.tier=Fabric",
-            ]
+            ],
+            label=f"Scaling Fabric capacity to {sku_name}",
         )
         print(f"[OK] Capacity scaled to {sku_name}")
         return True
@@ -1464,6 +1606,7 @@ def main() -> int:
     print(f"Project:      {cfg.project_name}")
     print(f"Workspace:    {cfg.fabric_workspace_name}")
     print(f"Turbo:        {cfg.turbo_deploy}")
+    print(f"Run attempts: {cfg.notebook_run_max_attempts}")
     if cfg.turbo_deploy:
         print(f"Turbo SKU:    {cfg.turbo_setup_sku} -> {cfg.turbo_scale_down_sku}")
 
@@ -1492,9 +1635,46 @@ def main() -> int:
         if not skipped_launcher:
             notebook_id, job_id = run_launcher_notebook_if_present(cfg, ws_id)
             if notebook_id and job_id:
-                final_status = wait_for_notebook_completion(cfg, ws_id, notebook_id, job_id)
-                if final_status:
-                    print(f"[INFO] Notebook run finished with status: {final_status}")
+                final_status = None
+                attempt_no = 1
+                current_notebook_id = notebook_id
+                current_job_id = job_id
+
+                while current_notebook_id and current_job_id and attempt_no <= cfg.notebook_run_max_attempts:
+                    if attempt_no > 1:
+                        print(
+                            f"[INFO] Notebook run retry {attempt_no}/{cfg.notebook_run_max_attempts} "
+                            f"starting after {cfg.notebook_retry_delay_seconds}s delay..."
+                        )
+                        time.sleep(cfg.notebook_retry_delay_seconds)
+
+                    final_status = wait_for_notebook_completion(
+                        cfg,
+                        ws_id,
+                        current_notebook_id,
+                        current_job_id,
+                    )
+                    if final_status:
+                        print(
+                            f"[INFO] Notebook run attempt {attempt_no}/{cfg.notebook_run_max_attempts} "
+                            f"finished with status: {final_status}"
+                        )
+
+                    if final_status in {"completed", "succeeded", "success"}:
+                        break
+
+                    if attempt_no >= cfg.notebook_run_max_attempts:
+                        break
+
+                    retry_notebook_id, retry_job_id = run_launcher_notebook_if_present(cfg, ws_id)
+                    if retry_notebook_id and retry_job_id:
+                        current_notebook_id = retry_notebook_id
+                        current_job_id = retry_job_id
+                        attempt_no += 1
+                        continue
+
+                    print("[WARN] Could not start retry notebook run.")
+                    break
 
                 if cfg.turbo_deploy:
                     # Scale down after notebook reaches terminal state (success or failure).
