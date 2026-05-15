@@ -1,0 +1,14 @@
+# Normalize text files and enforce LF by default across platforms.
+* text=auto eol=lf
+
+# Common source and config formats should always remain LF.
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Windows-native scripts should keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -9,11 +9,11 @@ If you see an error like:
 Or if deployment fails with a message about missing `FABRIC_CAPACITY_ADMINS`, manually set both the environment and config values:
 
 ```bash
-azd env set FABRIC_CAPACITY_ADMINS '["admin@MngEnvMCAP176643.onmicrosoft.com"]'
-azd env config set infra.parameters.fabricCapacityAdmins '["admin@MngEnvMCAP176643.onmicrosoft.com"]'
+azd env set FABRIC_CAPACITY_ADMINS '["<REPLACE_WITH_YOUR_EMAIL>"]'
+azd env config set infra.parameters.fabricCapacityAdmins '["<REPLACE_WITH_YOUR_EMAIL>"]'
 ```
 
-Replace the email with your Azure account UPN if different. Then rerun:
+Replace `<REPLACE_WITH_YOUR_EMAIL>` with your Azure account UPN if different. Then rerun:
 
 ```bash
 bash scripts/azd/run_all.sh --turbodeploy

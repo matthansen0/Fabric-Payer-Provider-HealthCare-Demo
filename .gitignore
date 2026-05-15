@@ -31,3 +31,6 @@ desktop.ini
 
 # Temp fix/debug scripts
 _scratch/
+
+# Dev container local state
+.devcontainer/devcontainer-lock.json
