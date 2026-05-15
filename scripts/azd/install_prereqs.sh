@@ -54,6 +54,20 @@ install_azd() {
 }
 
 install_python_requests() {
+  if ensure_cmd python3; then
+    info "python3 already installed"
+  else
+    info "Installing python3"
+    run_root apt-get update -y
+    run_root apt-get install -y python3
+  fi
+  if ensure_cmd pip3; then
+    info "pip3 already installed"
+  else
+    info "Installing python3-pip"
+    run_root apt-get update -y
+    run_root apt-get install -y python3-pip
+  fi
   if python3 - <<'PY' >/dev/null 2>&1
 import requests
 PY
@@ -61,8 +75,9 @@ PY
     info "python requests already installed"
     return
   fi
-  info "Installing python dependency: requests"
-  python3 -m pip install --user requests
+  info "Installing python dependency: requests via apt"
+  run_root apt-get update -y
+  run_root apt-get install -y python3-requests
 }
 
 main() {
